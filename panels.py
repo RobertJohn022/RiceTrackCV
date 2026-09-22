@@ -1,8 +1,8 @@
 import cv2
 import numpy
 
-lcc = cv2.imread('assets/lcc.jpg')          # PANELS
-rice1 = cv2.imread('assets/pixel1.png')     # RICE PIC TEST
+lcc = cv2.imread('images/lcc.jpg')          # PANELS
+rice1 = cv2.imread('images/pixel1.png')     # RICE PIC TEST
 
 # Make window bigger (400,400) but keep original resolution (32,32)
 bigRice1 = cv2.resize(rice1, (400, 400), interpolation=cv2.INTER_NEAREST)

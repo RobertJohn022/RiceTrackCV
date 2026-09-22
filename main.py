@@ -12,9 +12,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle('Rice Track')
         self.resize(500, 400)
 
-        self.serial_conn = None  # will hold the pyserial connection
+        self.serial_conn = None
 
-        # ---- Widgets ----
+        # ============================================================ WIDGETS
         self.port_dropdown = QComboBox()
 
         self.refresh_btn = QPushButton("Refresh")
@@ -27,7 +27,7 @@ class MainWindow(QMainWindow):
         self.input_line.setPlaceholderText("Type a command to send...")
         self.send_btn = QPushButton("Send")
 
-        # ---- Layout ----
+        # ============================================================ LAYOUT
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel("Port:"))
         top_row.addWidget(self.port_dropdown)
@@ -47,7 +47,7 @@ class MainWindow(QMainWindow):
         container.setLayout(main_layout)
         self.setCentralWidget(container)
 
-        # ---- Signal connections ----
+        # ============================================================ WIP IDK
         # self.refresh_btn.clicked.connect(self.refresh_ports)
         # self.connect_btn.clicked.connect(self.toggle_connection)
         # self.send_btn.clicked.connect(self.send_data)
