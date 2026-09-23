@@ -1,16 +1,18 @@
 import sys
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QFrame, QButtonGroup, QStackedWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy)
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+    QTextEdit, QPushButton, QFrame, QButtonGroup, QStackedWidget, QTableWidget, 
+    QTableWidgetItem, QHeaderView, QSizePolicy, QFileDialog)
+
+from PySide6.QtGui import QPixmap
 from PySide6.QtCore import Qt
 
 GREEN_BUTTON_STYLE = (
-    "background-color: #7cb96f; color: white; border: 1px solid #5c9a4f;")
+    "font-size: 16px; background-color: #7cb96f; color: white; border: 1px solid #5c9a4f;")
 GRAY_BUTTON_STYLE = (
-    "background-color: #999999; color: white; border: 1px solid #777777;")
+    "font-size: 16px; background-color: #999999; color: white; border: 1px solid #777777;")
 
-def make_title_block(text): # Header
+def make_header(text): # Header
     """Returns (title_label, divider_line) for the header of a page."""
     title = QLabel(text)
     title.setStyleSheet("font-size: 24px; font-weight: bold; padding: 12px; background-color: white;")
@@ -33,12 +35,13 @@ class ControlsPage(QWidget):
         self.go_to_results = go_to_results  # switch pages
         self.setStyleSheet("background-color: #DDDDDD; color: black")
         self.setAttribute(Qt.WA_StyledBackground, True)
- 
+        self.latest_image_path = None
+
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
  
-        title, divider = make_title_block("RiceTrack - Rover Control")
+        title, divider = make_header("RiceTrack - Rover Control")
         main_layout.addWidget(title)
         main_layout.addWidget(divider)
  
@@ -52,7 +55,8 @@ class ControlsPage(QWidget):
  
         main_layout.addStretch()
 
-    # =========================================================================== LEFT - Display, GPS, IMU  (WIP) 
+    # ========================================================================================== LEFT PANEL
+    # ========================================================================================== Camera Display, GPS, IMU  (WIP) 
     def _build_left_panel(self):
         layout = QVBoxLayout()
 
@@ -69,7 +73,7 @@ class ControlsPage(QWidget):
         camera_box.setMinimumHeight(480)
         layout.addWidget(camera_box)
 
-        gps_box = QLabel("GPS:")
+        gps_box = QLabel("GPS: 15.671251° N, 120.894321° E")
         gps_box.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         gps_box.setStyleSheet(
             "background-color: white; border: 1px solid black; "
@@ -77,37 +81,39 @@ class ControlsPage(QWidget):
         )
         gps_box.setFixedHeight(40)
         layout.addWidget(gps_box)
-        layout.setSpacing(4)
+        layout.setSpacing(12)
 
         return layout
 
-    # ========================================================================================== RIGHT - Controls, Short Info (WIP) 
+    # ========================================================================================== RIGHT PANEL
+    # ========================================================================================== Controls
     def _build_right_panel(self):
         layout = QVBoxLayout()
 
-        controls_label = QLabel("Controls:")
-        controls_label.setStyleSheet("font-size: 16px; color: black; border: 1px solid black")
-        controls_label.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
-        layout.addWidget(controls_label)
+        self.controls_label = QLabel("Controls:")
+        self.controls_label.setStyleSheet("font-size: 16px; color: black; border: 1px solid black")
+        self.controls_label.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+        layout.addWidget(self.controls_label)
 
-        self.status_box = QLabel("[Manual]")
-        self.status_box.setAlignment(Qt.AlignCenter)
-        self.status_box.setStyleSheet(
-            "background-color: white; border: 1px solid black; font-size: 18px; color: black"
-        )
-        self.status_box.setMinimumHeight(180)
-        layout.addWidget(self.status_box)
+        self.control_box = QLabel("[Manual]")
+        # self.control_box.setAlignment(Qt.AlignTop)
+        self.control_box.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.control_box.setStyleSheet(
+            "background-color: white; border: 1px solid black; font-size: 16px; color: black")
+        self.control_box.setMinimumHeight(200)
+
+        layout.addWidget(self.control_box)
 
         # ========================================================================================== Manual / Automatic toggle 
         btn_row = QHBoxLayout()
-
         self.manual_btn = QPushButton("Manual")
         self.automatic_btn = QPushButton("Automatic")
 
         for btn in (self.manual_btn, self.automatic_btn):
             btn.setCheckable(True)
-            btn.setFixedHeight(40)
+            btn.setFixedHeight(30)
             btn_row.addWidget(btn)
+            btn_row.setAlignment(Qt.AlignBottom)
 
         self.mode_group = QButtonGroup(self)
         self.mode_group.setExclusive(True)
@@ -118,23 +124,39 @@ class ControlsPage(QWidget):
         self.manual_btn.toggled.connect(self._update_mode_display)
         self.automatic_btn.toggled.connect(self._update_mode_display)
 
-        layout.addLayout(btn_row)
+        # layout.addLayout(btn_row)
+        self.control_box.setLayout(btn_row)
 
-        # ========================================================================================== Capture Image (WIP) 
+        # ========================================================================================== Capture/Upload Image (WIP) 
+        img_row = QHBoxLayout()
+
         capture_btn = QPushButton("Capture Image")
+        capture_btn.setStyleSheet(GRAY_BUTTON_STYLE)
         capture_btn.setFixedHeight(40)
-        capture_btn.setStyleSheet(GREEN_BUTTON_STYLE)
-        layout.addWidget(capture_btn)
+        img_row.addWidget(capture_btn)
+        
+        upload_btn = QPushButton("Upload Image")
+        upload_btn.setStyleSheet(GRAY_BUTTON_STYLE)
+        upload_btn.setFixedHeight(40)
+        img_row.addWidget(upload_btn)
+        upload_btn.clicked.connect(self._upload_image)
 
-        # =========================================================================== Latest capture box (WIP) 
-        latest_label = QLabel("LATEST CAPTURE:")
-        latest_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        latest_label.setStyleSheet(
-            "background-color: white; border: 1px solid black; "
-            "font-weight: bold; padding: 8px; color: black"
-        )
-        latest_label.setMinimumHeight(150)
-        layout.addWidget(latest_label)
+        layout.addLayout(img_row)
+
+        # ========================================================================================== Latest capture box (WIP) 
+        self.capture_label = QLabel("Latest Capture:")
+        self.capture_label.setStyleSheet("font-size: 16px; color: black; border: 1px solid black; margin-top: 20px")
+        self.capture_label.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+        layout.addWidget(self.capture_label)
+        
+        self.capture_display = QLabel("No image uploaded yet")
+        self.capture_display.setAlignment(Qt.AlignCenter)
+        self.capture_display.setStyleSheet(
+            "background-color: white; border: 1px solid black; color: black")
+        self.capture_display.setMinimumHeight(150)
+        self.capture_display.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(self.capture_display)
 
         results_btn = QPushButton("Results Tab")
         results_btn.setFixedHeight(40)
@@ -144,26 +166,54 @@ class ControlsPage(QWidget):
         layout.addWidget(results_btn)
         
         self._update_mode_display()
-        layout.setSpacing(4)
+        layout.setSpacing(12)
         return layout
 
-    # =========================================================================== Called whenever Manual or Automatic pressed: 
+    # ========================================================================================== BUTTON FUNCTIONALITIES
+    # ========================================================================================== Manual / Automatic toggle: 
     def _update_mode_display(self):
         if self.automatic_btn.isChecked():
-            self.status_box.setText("[Automatic]")
+            self.controls_label.setText("Control: Automatic")
+            self.control_box.setText("\nSet Distance: _5m_\n1. Idle\n2. Moving\n3. Capturing\n4. Analyzing")
         else:
-            self.status_box.setText("[Manual]")
+            self.controls_label.setText("Control: Manual")
+            self.control_box.setText("\nCONTROLS: \nForward/Backward: W/S\nLeft/Right: A/D\nCapture: Space")
 
-        active_style = "background-color: #7cb96f; color: white; border: 1px solid #5c9a4f;"
-        inactive_style = "background-color: #999999; color: white; border: 1px solid #777777;"
+        active_style = "font-size: 16px; background-color: #7cb96f; color: white; border: 1px solid #5c9a4f;"
+        inactive_style = "font-size: 16px; background-color: #999999; color: white; border: 1px solid #777777;"
 
         self.manual_btn.setStyleSheet(
             active_style if self.manual_btn.isChecked() else inactive_style)
         self.automatic_btn.setStyleSheet(
             active_style if self.automatic_btn.isChecked() else inactive_style)
 
-# ===============================================================================================
-# =========================================================================== Field Results
+    # ========================================================================================== Upload and display img
+    def _upload_image(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select an Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp)" )
+ 
+        if not file_path:
+            return
+ 
+        self.latest_image_path = file_path  # stores img
+ 
+        pixmap = QPixmap(file_path)
+        if pixmap.isNull():
+            self.capture_display.setText("Could not load image")
+            return
+ 
+        scaled_pixmap = pixmap.scaled(
+            self.capture_display.width(),
+            self.capture_display.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        self.capture_display.setPixmap(scaled_pixmap)
+
+# ==============================================================================================================
+# ========================================================================================== Field Results
 class ResultsPage(QWidget):
     def __init__(self, go_to_controls):
         super().__init__()
@@ -175,7 +225,7 @@ class ResultsPage(QWidget):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
  
-        title, divider = make_title_block("RiceTrack - Survey Results")
+        title, divider = make_header("RiceTrack - Survey Results")
         main_layout.addWidget(title)
         main_layout.addWidget(divider)
  
@@ -194,7 +244,7 @@ class ResultsPage(QWidget):
         main_layout.addStretch()
         main_layout.addLayout(self._build_nav_row())
 
- # =========================================================================== Overview
+ # ========================================================================================== Overview
     def _build_stats_row(self):
         row = QHBoxLayout()
         row.setSpacing(0)
@@ -222,7 +272,7 @@ class ResultsPage(QWidget):
         col.addWidget(value_label)
         return box
 
- # =========================================================================== Table
+ # ========================================================================================== Table
     def _build_table(self):
         columns = ["Time", "Location", "Rice Variety", "Height", "Leaf Color", "Status"]
         # Placeholder rows
@@ -272,7 +322,7 @@ class ResultsPage(QWidget):
         row.addStretch()
         return row
 
-# =========================================================================== Main Window - switche between pages
+# ========================================================================================== Main Window - switche between pages
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -294,7 +344,7 @@ class MainWindow(QMainWindow):
     def show_controls(self):
         self.stack.setCurrentWidget(self.controls_page)
 
-# =========================================================================== Starts the app idk 
+# ========================================================================================== Starts the app idk 
 def main():
     app = QApplication(sys.argv)
     window = MainWindow()
