@@ -207,6 +207,7 @@ class StepList(QWidget):
 class ManualView(QWidget):
     switch_auto = Signal()
     command = Signal(str)
+    record_saved = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -216,6 +217,7 @@ class ManualView(QWidget):
         self.segmented_bgr = None
         self.showing_segmented = False
         self.last_result = None
+        self.record_saved_for_image = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -371,10 +373,13 @@ class ManualView(QWidget):
             self._cancel_image()
 
     def _on_capture_button(self):
-        if self.image_bgr is not None and self.last_result is not None:
-            self._evaluate_and_save()
-        else:
-            self._capture()
+        # An uploaded photo is evaluated locally; it must not fall through to
+        # the rover capture command just because CV has not run yet.
+        if self.image_bgr is not None:
+            if not self.record_saved_for_image:
+                self._evaluate_and_save()
+            return
+        self._capture()
 
     def _upload_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -393,31 +398,15 @@ class ManualView(QWidget):
         self.segmented_bgr = None
         self.showing_segmented = False
         self.last_result = None
+        self.record_saved_for_image = False
+
         self.camera.set_frame(cv_to_qpixmap(img))
         self.image_value.setText("✓ Loaded")
-        self.status_chip.set_text("Evaluating…", "gray")
-        self.analysis_value.setText("Segmenting and evaluating leaf color…")
-        self.capture_note.setText("")
+        self.status_chip.set_text("Ready", "gray")
+        self.analysis_value.setText("Photo loaded. Press Evaluate to analyze and save it.")
+        self.capture_note.setText("Ready to evaluate")
         self._set_image_mode(True)
-
-        try:
-            result = evaluate(img)
-        except NoVegetationDetected as exc:
-            self.status_chip.set_text("No vegetation", "orange")
-            self.analysis_value.setText(str(exc))
-            return
-
-        self.last_result = result
-        self.segmented_bgr = overlay_mask(img, result.mask)
-        self.showing_segmented = True
-        self.camera.set_frame(cv_to_qpixmap(self.segmented_bgr))
-
-        healthy = result.status == "Healthy"
-        self.status_chip.set_text(result.status, "green" if healthy else "red")
-        self.analysis_value.setText(
-            f"{result.panel} · hue {result.mean_hue:.0f} · "
-            f"coverage {result.coverage_pct:.0f}%"
-        )
+        self._update_capture_enabled()
 
     def _cancel_image(self):
         self.image_bgr = None
@@ -429,6 +418,8 @@ class ManualView(QWidget):
         self.image_value.setText("")
         self.status_chip.set_text("No image", "gray")
         self.analysis_value.setText("")
+        self.capture_note.setText("")
+        self.record_saved_for_image = False
         self._set_image_mode(False)
 
     def _set_image_mode(self, active):
@@ -450,15 +441,76 @@ class ManualView(QWidget):
         self.camera.set_frame(cv_to_qpixmap(frame))
 
     def _evaluate_and_save(self):
-        result = self.last_result
+        if self.image_bgr is None:
+            self.analysis_value.setText("Upload a photo before evaluating.")
+            return
+
+        self.status_chip.set_text("Evaluating…", "gray")
+        self.analysis_value.setText("Segmenting and evaluating leaf color…")
+        self.capture_note.setText("Evaluating…")
+
+        try:
+            result = evaluate(self.image_bgr)
+        except NoVegetationDetected as exc:
+            self.last_result = None
+            self.segmented_bgr = None
+            self.showing_segmented = False
+            self.status_chip.set_text("No vegetation", "orange")
+            self.analysis_value.setText(str(exc))
+            self.capture_note.setText("Evaluation failed. Upload a clearer rice-canopy photo.")
+            return
+        except Exception as exc:
+            self.last_result = None
+            self.segmented_bgr = None
+            self.showing_segmented = False
+            self.status_chip.set_text("Evaluation error", "red")
+            self.analysis_value.setText(f"Could not evaluate the image: {exc}")
+            self.capture_note.setText("Evaluation failed.")
+            return
+
+        self.last_result = result
+        self.segmented_bgr = overlay_mask(self.image_bgr, result.mask)
+        self.showing_segmented = True
+        self.camera.set_frame(cv_to_qpixmap(self.segmented_bgr))
+
+        healthy = result.status == "Healthy"
+        self.status_chip.set_text(result.status, "green" if healthy else "red")
+        self.analysis_value.setText(
+            f"{result.panel} · median hue {result.median_hue:.0f} · "
+            f"coverage {result.coverage_pct:.0f}% · "
+            f"Lab {result.lab_l:.0f}/{result.lab_a:.0f}/{result.lab_b:.0f}"
+        )
+
         record = {
-            "avg_hue": result.mean_hue,
+            "avg_hue": result.median_hue,
             "leaf_report": result.tone,
             "image": encode_thumbnail(self.image_bgr),
+            "lab_l": result.lab_l,
+            "lab_a": result.lab_a,
+            "lab_b": result.lab_b,
+            "hue_method": "median",
+            "segmentation_v_min": 12,
         }
-        record_id = database.insert_record(record)
-        self.capture_note.setText(f"Saved record {record_id} to the database.")
-        self._cancel_image()
+
+        try:
+            record_id = database.insert_record(record)
+        except Exception as exc:
+            self.status_chip.set_text("Database error", "red")
+            self.analysis_value.setText(
+                f"Evaluation succeeded, but saving failed: {exc}"
+            )
+            self.capture_note.setText("Record was not saved.")
+            return
+
+        # Keep the evaluated/segmented image visible after saving and show the
+        # requested confirmation in the lower-right status area.
+        self.record_saved_for_image = True
+        self.capture_btn.setEnabled(False)
+        self.analysis_value.setText(
+            "Report saved to database. View results at the Records tab."
+        )
+        self.capture_note.setText("Report saved to database. View results at the Records tab.")
+        self.record_saved.emit(record_id)
 
     def _capture(self):
         if self.capture_btn.isEnabled():
@@ -467,6 +519,15 @@ class ManualView(QWidget):
     def set_tilt_limit(self, limit):
         self.tilt_limit = limit
         self.set_attitude(self._roll, self._pitch, self._speed)
+
+    def _update_capture_enabled(self):
+        # Rover tilt locks physical capture, but an uploaded photo must still
+        # be evaluable. The button is "Evaluate" whenever an image is loaded.
+        tilted = max(abs(self._roll), abs(self._pitch)) > self.tilt_limit
+        self.capture_btn.setEnabled(
+            (self.image_bgr is not None and not self.record_saved_for_image) or
+            (self.image_bgr is None and not tilted)
+        )
 
     def set_attitude(self, roll, pitch, speed):
         self._roll, self._pitch, self._speed = roll, pitch, speed
@@ -479,9 +540,20 @@ class ManualView(QWidget):
         tilt = max(abs(roll), abs(pitch))
         tilted = tilt > limit
         self.alert.setVisible(tilted)
-        self.alert_text.setText(f"Rover tilted {tilt:.0f}°, above the {limit}° limit. Reposition before capturing.")
-        self.capture_btn.setEnabled(not tilted)
-        self.capture_note.setText("Capture locked until rover is stable" if tilted else "Ready to capture")
+        self.alert_text.setText(
+            f"Rover tilted {tilt:.0f}°, above the {limit}° limit. "
+            "Reposition before capturing."
+        )
+        self._update_capture_enabled()
+
+        if self.image_bgr is None:
+            self.capture_note.setText(
+                "Capture locked until rover is stable" if tilted else "Ready to capture"
+            )
+        elif self.record_saved_for_image:
+            self.capture_note.setText("Report saved to database. View results at the Records tab.")
+        else:
+            self.capture_note.setText("Ready to evaluate")
 
     def set_capture_progress(self, capture_id, image_saved, gps_done, gps_total, analysis):
         self.capture_id.set_text(capture_id)
@@ -571,6 +643,7 @@ class AutoView(QWidget):
 
 class ControlPage(QWidget):
     command = Signal(str)
+    record_saved = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -586,6 +659,7 @@ class ControlPage(QWidget):
         self.manual.switch_auto.connect(lambda: self.stack.setCurrentWidget(self.auto))
         self.auto.take_over.connect(lambda: self.stack.setCurrentWidget(self.manual))
         self.manual.command.connect(self.command)
+        self.manual.record_saved.connect(self.record_saved)
 
     def set_attitude(self, roll, pitch, speed):
         self.manual.set_attitude(roll, pitch, speed)

@@ -25,9 +25,10 @@ CHIP_COLORS = {
     "blue":   (BLUE_BG, BLUE_TEXT),
 }
 
+# Calibrated to IRRI 4-panel LCC standards for standard inbreds (NSIC Rc 222 / Tubigan 18)
 STANDARDS = {
-    "variety": "Tubigan 18",
-    "hue": (52, 65),
+    "variety": "NSIC Rc 222 (Tubigan 18)",
+    "hue": (50, 75),  # Healthy/Optimal greenness band (LCC Panels 4 & 5)
     "height": (98, 101),
     "pole": 1.2,
     "gps_n": 5,

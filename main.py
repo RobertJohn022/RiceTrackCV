@@ -93,9 +93,9 @@ class MainWindow(QMainWindow):
         self.control_page = ControlPage()
         self.map_page = FieldMapPage()
         self.records_page = RecordsPage()
+        self.control_page.record_saved.connect(self._record_saved)
         self.validation_page = ValidationPage()
         self.standards_page = StandardsPage()
-        self.control_page.record_saved.connect(self._record_saved)
         
         for page in (self.control_page, self.map_page, self.records_page,
                      self.validation_page, self.standards_page):
@@ -111,10 +111,9 @@ class MainWindow(QMainWindow):
 
     def _navigate(self, index):
         self.stack.setCurrentIndex(index)
-        widget = self.stack.widget(index)
-        if widget is self.records_page:
+        if self.stack.widget(index) is self.records_page:
             self.records_page.refresh()
-        elif widget is self.validation_page:
+        elif self.stack.widget(index) is self.validation_page:
             self.validation_page.refresh()
 
     def _open_record(self, record_id):
@@ -126,6 +125,7 @@ class MainWindow(QMainWindow):
         self.control_page.set_tilt_limit(STANDARDS["tilt"])
         self.control_page.auto.set_progress(self.control_page.auto.stop, self.control_page.auto.step)
         self.records_page.refresh()
+        self.validation_page.refresh()
 
 def main():
     app = QApplication(sys.argv)

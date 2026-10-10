@@ -1,12 +1,11 @@
 """
 database.py
 -------------
-SQLite-backed storage for RiceTrack inspection records and validation pairs.
+SQLite-backed storage for RiceTrack operational records and validation data.
 
-Operational records are written by tab_control.py and read by tab_records.py.
-Validation readings are kept separately so manual/reference measurements do
-not masquerade as rover/CV results. tab_validation.py pairs a reference
-reading with an existing CV record and computes live MAE/RMSE statistics.
+Operational records contain the CV result. Validation readings are stored
+separately so manual/reference measurements do not masquerade as rover/CV
+measurements.
 """
 
 import math
@@ -24,7 +23,7 @@ DEFAULT_GPS = "15.67170, 120.89280"
 DEFAULT_AVG_HEIGHT = 100.0
 DEFAULT_HEIGHT_REPORT = "healthy"
 
-# Preliminary Health Index constants stated in the thesis methodology.
+# Preliminary Health Index constants from the thesis methodology.
 IDEAL_HUE = 58.5
 MAX_HUE_DEVIATION = 27.5
 IDEAL_HEIGHT = 99.5
@@ -36,6 +35,14 @@ def _connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _add_column_if_missing(conn, table: str, column: str, definition: str):
+    existing = {
+        row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def init_db():
@@ -57,6 +64,15 @@ def init_db():
             )
             """
         )
+
+        # Demo color-calibration fields. They are nullable so existing DBs
+        # remain compatible with older records.
+        _add_column_if_missing(conn, "records", "lab_l", "REAL")
+        _add_column_if_missing(conn, "records", "lab_a", "REAL")
+        _add_column_if_missing(conn, "records", "lab_b", "REAL")
+        _add_column_if_missing(conn, "records", "hue_method", "TEXT")
+        _add_column_if_missing(conn, "records", "segmentation_v_min", "INTEGER")
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS validation_readings (
@@ -109,14 +125,22 @@ def compute_test_status(manual_height: float, manual_hue: float) -> str:
 
 
 def _health_index_scores(manual_height: float, manual_hue: float):
-    """Apply the preliminary Health Index formulas from the thesis."""
+    """Apply the preliminary thesis Health Index formulas."""
     color_score = max(
         0.0,
-        min(100.0, 100.0 - (abs(IDEAL_HUE - manual_hue) / MAX_HUE_DEVIATION * 100.0)),
+        min(
+            100.0,
+            100.0
+            - (abs(IDEAL_HUE - manual_hue) / MAX_HUE_DEVIATION * 100.0),
+        ),
     )
     height_score = max(
         0.0,
-        min(100.0, 100.0 - (abs(IDEAL_HEIGHT - manual_height) / IDEAL_HEIGHT * 100.0)),
+        min(
+            100.0,
+            100.0
+            - (abs(IDEAL_HEIGHT - manual_height) / IDEAL_HEIGHT * 100.0),
+        ),
     )
     health_index = 0.7 * color_score + 0.3 * height_score
     return color_score, height_score, health_index
@@ -130,13 +154,13 @@ def _next_id(conn, plot: str) -> str:
 
 
 def insert_record(record: dict) -> str:
-    """Insert one operational inspection record and return its generated ID."""
+    """Insert one operational inspection record and return its ID."""
     plot = record.get("plot", DEFAULT_PLOT)
     variant = record.get("variant", DEFAULT_VARIANT)
     gps = record.get("gps", DEFAULT_GPS)
     avg_height = record.get("avg_height", DEFAULT_AVG_HEIGHT)
     height_report = record.get("height_report", DEFAULT_HEIGHT_REPORT)
-    avg_hue = record["avg_hue"]
+    avg_hue = float(record["avg_hue"])
     leaf_report = record["leaf_report"]
     image_bytes = record.get("image")
     captured_at = record.get("captured_at") or datetime.now().isoformat(timespec="seconds")
@@ -151,11 +175,28 @@ def insert_record(record: dict) -> str:
             """
             INSERT INTO records
                 (id, captured_at, plot, variant, gps, avg_height, avg_hue,
-                 height_report, leaf_report, status, image)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 height_report, leaf_report, status, image,
+                 lab_l, lab_a, lab_b, hue_method, segmentation_v_min)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (record_id, captured_at, plot, variant, gps, avg_height, avg_hue,
-             height_report, leaf_report, status, image_bytes),
+            (
+                record_id,
+                captured_at,
+                plot,
+                variant,
+                gps,
+                avg_height,
+                avg_hue,
+                height_report,
+                leaf_report,
+                status,
+                image_bytes,
+                record.get("lab_l"),
+                record.get("lab_a"),
+                record.get("lab_b"),
+                record.get("hue_method", "median"),
+                record.get("segmentation_v_min", 12),
+            ),
         )
     return record_id
 
@@ -164,6 +205,7 @@ def fetch_records(month=None, plot=None, variant=None, status=None) -> list:
     """Return matching operational records, newest first."""
     query = "SELECT * FROM records WHERE 1=1"
     params = []
+
     if month and month != "All":
         query += " AND strftime('%Y-%m', captured_at) = ?"
         params.append(month)
@@ -179,6 +221,7 @@ def fetch_records(month=None, plot=None, variant=None, status=None) -> list:
         else:
             query += " AND status = ?"
             params.append(status)
+
     query += " ORDER BY captured_at DESC"
 
     with _connect() as conn:
@@ -210,17 +253,13 @@ def distinct_months() -> list:
     return [row[0] for row in rows if row[0]]
 
 
-def insert_validation_reading(record_id: str, manual_height: float,
-                              manual_hue: float, notes: str = "") -> int:
-    """
-    Store one manual/reference measurement linked to an existing CV record.
-
-    The persisted status is one of:
-      Test - Healthy
-      Test - Unhealthy - color
-      Test - Unhealthy - height
-      Test - Unhealthy - color + height
-    """
+def insert_validation_reading(
+    record_id: str,
+    manual_height: float,
+    manual_hue: float,
+    notes: str = "",
+) -> int:
+    """Store one manual/reference measurement linked to a CV record."""
     try:
         manual_height = float(manual_height)
         manual_hue = float(manual_hue)
@@ -286,6 +325,9 @@ def fetch_validation_pairs() -> list:
                 r.plot,
                 r.avg_height AS cv_height,
                 r.avg_hue AS cv_hue,
+                r.lab_l AS cv_lab_l,
+                r.lab_a AS cv_lab_a,
+                r.lab_b AS cv_lab_b,
                 v.manual_height,
                 v.manual_hue,
                 v.height_error,

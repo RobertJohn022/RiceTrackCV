@@ -10,7 +10,7 @@ import database
 from common import MUTED, RED_TEXT, TEXT, button, card, kv_row, lbl, make_pixmap, pill, set_prop
 
 COLUMN_WEIGHTS = [1, 1.5, 1, 1.2, 1, 1.3]
-COLUMN_TITLES = ["ID", "Date", "Plot", "Avg Height", "Avg Hue", "Status"]
+COLUMN_TITLES = ["ID", "Date", "Plot", "Avg Height", "Median Hue", "Status"]
 
 
 def _format_date(iso_str):
@@ -30,7 +30,7 @@ def _format_date_full(iso_str):
 def _status_pill(status):
     if status == "Healthy":
         return ("Healthy", "green")
-    if status.startswith("Test - Healthy"):
+    if status == "Test - Healthy":
         return ("Test · Healthy", "blue")
     if status.startswith("Test -"):
         return ("Test", "orange")
@@ -141,9 +141,19 @@ class RecordRow(QFrame):
         swatch.setFixedSize(14, 14)
         swatch.setStyleSheet(f"background:{_swatch_color(record['avg_hue'])}; border-radius:3px;")
         hue_row.addWidget(swatch)
-        hue_row.addWidget(lbl(f"{record['avg_hue']:.0f} · {record['leaf_report']}", 13, TEXT, "700"))
+        hue_row.addWidget(lbl(f"{record['avg_hue']:.1f} · {record['leaf_report']}", 13, TEXT, "700"))
         hue_row.addStretch()
-        col2.addLayout(kv_row("Avg hue", self._wrap(hue_row), MUTED))
+        col2.addLayout(kv_row("Median hue", self._wrap(hue_row), MUTED))
+
+        lab_l = record.get("lab_l")
+        lab_a = record.get("lab_a")
+        lab_b = record.get("lab_b")
+        lab_text = (
+            f"{lab_l:.1f} / {lab_a:.1f} / {lab_b:.1f}"
+            if lab_l is not None and lab_a is not None and lab_b is not None
+            else "--"
+        )
+        col2.addLayout(kv_row("CIELAB (L*/a*/b*)", lbl(lab_text, 13, TEXT, "700"), MUTED))
 
         col2.addLayout(kv_row(
             "Avg height",
@@ -246,8 +256,7 @@ class RecordsPage(QWidget):
         self._populate_combo(self.month_filter, months, month_labels)
         self._populate_combo(self.plot_filter, database.distinct("plot"))
         self._populate_combo(self.variant_filter, database.distinct("variant"))
-        statuses = database.distinct("status")
-        self._populate_combo(self.status_filter, statuses)
+        self._populate_combo(self.status_filter, database.distinct("status"))
 
         try:
             records = database.fetch_records(
