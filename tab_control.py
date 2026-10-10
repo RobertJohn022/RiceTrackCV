@@ -1,17 +1,18 @@
 import cv2
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPolygonF, QShortcut
+from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
 from PySide6.QtWidgets import (
-    QButtonGroup, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QMessageBox,
+    QApplication, QButtonGroup, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox,
     QProgressBar, QStackedWidget, QVBoxLayout, QWidget
 )
 from common import (
-    BG, BLUE, GOOD, GREEN, MUTED, RED_BG, RED_TEXT, TEXT, STANDARDS,
+    BG, BLUE, GOOD, GREEN, LINE, MUTED, RED_BG, RED_LINE, RED_TEXT, TEXT, STANDARDS,
     Chip, banner, button, card, kv_row, lbl, make_pixmap, set_prop
 )
 from vision import NoVegetationDetected, cv_to_qpixmap, encode_thumbnail, evaluate, overlay_mask
 import database
+from imu import IMUReader
 
 class AttitudeTile(QFrame):
     def __init__(self, name):
@@ -33,23 +34,46 @@ class AttitudeTile(QFrame):
         self.value.setStyleSheet(f"font-size: 17px; font-weight: 700; color: {RED_TEXT if danger else TEXT};")
         self.value.setText(text)
 
+class StatusBanner(QFrame):
+    """Always-visible status strip: red = problem, green = all good."""
+    STYLES = {
+        "red":   (RED_BG,   RED_LINE,   RED_TEXT, "info"),
+        "green": ("#11260f", "#1d4a1a", GOOD,     "check"),
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("statusbanner")
+        self._kind = None
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(8)
+        self.icon = QLabel()
+        self.icon.setFixedSize(16, 16)
+        self.text = lbl("", 13, TEXT)
+        lay.addWidget(self.icon)
+        lay.addWidget(self.text, 1)
+
+    def set_state(self, kind, text):
+        if kind != self._kind:
+            bg, line, fg, icon = self.STYLES[kind]
+            self.setStyleSheet(
+                f"QFrame#statusbanner {{ background: {bg}; border: 1px solid {line}; border-radius: 10px; }}")
+            self.icon.setPixmap(make_pixmap(icon, fg, 16))
+            self.text.setStyleSheet(f"font-size: 13px; color: {fg};")
+            self._kind = kind
+        self.text.setText(text)
+
 class CameraView(QWidget):
-    BLADES = [
-        (.07, .95, .11, .42), (.18, .97, .22, .28), (.29, .98, .30, .36), (.40, .97, .37, .27),
-        (.52, .98, .56, .33), (.64, .96, .67, .20), (.77, .94, .74, .16)]
+    PLACEHOLDER = "No camera detected. Click to add image"
 
     clicked = Signal()
 
     def __init__(self):
         super().__init__()
-        self._roll = 0.0
         self._frame = None
         self.setMinimumSize(300, 220)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def set_roll(self, roll):
-        self._roll = roll
-        self.update()
 
     def set_frame(self, pixmap):
         self._frame = pixmap
@@ -75,25 +99,17 @@ class CameraView(QWidget):
             p.drawPixmap((w - scaled.width()) // 2, (h - scaled.height()) // 2, scaled)
             return
 
-        p.fillRect(QRectF(0, 0, w, h), QColor("#eaf3de"))
-
-        diff = max(-0.4, min(0.4, 0.19 * self._roll / 17.0)) * h
-        mid = 0.56 * h
-        ground = QPolygonF([QPointF(0, mid + diff / 2), QPointF(w, mid - diff / 2),
-                            QPointF(w, h), QPointF(0, h)])
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#c0dd97"))
-        p.drawPolygon(ground)
-
-        pen = QPen(QColor("#173404"), 3.2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
+        p.fillRect(QRectF(0, 0, w, h), QColor(BG))
+        p.setPen(QPen(QColor(LINE), 1.5, Qt.PenStyle.DashLine))
         p.setBrush(Qt.BrushStyle.NoBrush)
-        for bx, by, tx, ty in self.BLADES:
-            path = QPainterPath(QPointF(bx * w, by * h))
-            path.quadTo(QPointF((bx + (tx - bx) * 0.15 - 0.03) * w, (by + ty) / 2 * h),
-                        QPointF(tx * w, ty * h))
-            p.drawPath(path)
+        p.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 8, 8)
+
+        font = p.font()
+        font.setPixelSize(13)
+        p.setFont(font)
+        p.setPen(QColor(MUTED))
+        p.drawText(QRectF(0, 0, w, h),
+                   Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self.PLACEHOLDER)
 
 class RouteMap(QWidget):
     def __init__(self):
@@ -213,6 +229,7 @@ class ManualView(QWidget):
         super().__init__()
         self.tilt_limit = STANDARDS["tilt"]
         self._roll, self._pitch, self._speed = 0.0, 0.0, 0.0
+        self._imu_ok = False
         self.image_bgr = None
         self.segmented_bgr = None
         self.showing_segmented = False
@@ -223,17 +240,7 @@ class ManualView(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
-        status = QHBoxLayout()
-        status.setSpacing(8)
-        status.addWidget(Chip("Link 142 m", "green", "signal"))
-        status.addWidget(Chip("Feed 24 fps", "green", "wifi"))
-        status.addWidget(Chip("9 sats", "green", "target"))
-        status.addStretch()
-        self.battery = Chip("46% · ~40 min", "orange", "battery")
-        status.addWidget(self.battery)
-        root.addLayout(status)
-
-        self.alert, self.alert_text = banner("red")
+        self.alert = StatusBanner()
         root.addWidget(self.alert)
 
         body = QHBoxLayout()
@@ -247,7 +254,7 @@ class ManualView(QWidget):
             shortcut.activated.connect(lambda c=cmd: self.command.emit(c))
         QShortcut(QKeySequence("C"), self).activated.connect(self._capture)
 
-        self.set_attitude(17, 4, 0.0)
+        self.set_attitude(0.0, 0.0, 0.0)
         self.set_capture_progress("A-02-03", True, 3, STANDARDS["gps_n"], "Waiting for GPS")
 
     def _build_left(self):
@@ -529,21 +536,31 @@ class ManualView(QWidget):
             (self.image_bgr is None and not tilted)
         )
 
-    def set_attitude(self, roll, pitch, speed):
+    def set_imu_available(self, ok):
+        """False -> no ESP32 / no MPU-6050: roll and pitch fall back to 0."""
+        self._imu_ok = ok
+        if not ok:
+            self._roll = self._pitch = 0.0
+        self.set_attitude(self._roll, self._pitch)
+
+    def set_attitude(self, roll, pitch, speed=None):
+        if speed is None:
+            speed = self._speed
         self._roll, self._pitch, self._speed = roll, pitch, speed
         limit = self.tilt_limit
         self.roll_tile.set_value(f"{roll:.0f}°", abs(roll) > limit)
         self.pitch_tile.set_value(f"{pitch:.0f}°", abs(pitch) > limit)
         self.speed_tile.set_value(f"{speed:.1f} m/s", False)
-        self.camera.set_roll(roll)
 
         tilt = max(abs(roll), abs(pitch))
         tilted = tilt > limit
-        self.alert.setVisible(tilted)
-        self.alert_text.setText(
-            f"Rover tilted {tilt:.0f}°, above the {limit}° limit. "
-            "Reposition before capturing."
-        )
+        if not self._imu_ok:
+            self.alert.set_state("red", "No IMU sensors detected")
+        elif tilted:
+            self.alert.set_state(
+                "red", f"Rover tilted {tilt:.0f}°, above the {limit}° limit. Reposition before capturing.")
+        else:
+            self.alert.set_state("green", f"Rover level · {tilt:.0f}° tilt, within the {limit}° limit")
         self._update_capture_enabled()
 
         if self.image_bgr is None:
@@ -661,7 +678,13 @@ class ControlPage(QWidget):
         self.manual.command.connect(self.command)
         self.manual.record_saved.connect(self.record_saved)
 
-    def set_attitude(self, roll, pitch, speed):
+        self.imu = IMUReader(parent=self)
+        self.imu.reading.connect(self.manual.set_attitude)
+        self.imu.state_changed.connect(self.manual.set_imu_available)
+        QApplication.instance().aboutToQuit.connect(self.imu.stop)
+        self.imu.start()
+
+    def set_attitude(self, roll, pitch, speed=None):
         self.manual.set_attitude(roll, pitch, speed)
 
     def set_tilt_limit(self, limit):
