@@ -28,7 +28,13 @@ def _format_date_full(iso_str):
 
 
 def _status_pill(status):
-    return ("Healthy", "green") if status == "Healthy" else ("Inspect", "red")
+    if status == "Healthy":
+        return ("Healthy", "green")
+    if status.startswith("Test - Healthy"):
+        return ("Test · Healthy", "blue")
+    if status.startswith("Test -"):
+        return ("Test", "orange")
+    return ("Inspect", "red")
 
 
 def _swatch_color(avg_hue):
@@ -233,17 +239,32 @@ class RecordsPage(QWidget):
 
     def refresh(self):
         months = database.distinct_months()
-        month_labels = [datetime.strptime(m, "%Y-%m").strftime("%B %Y") for m in months]
+        month_labels = [
+            datetime.strptime(m, "%Y-%m").strftime("%B %Y")
+            for m in months if m
+        ]
         self._populate_combo(self.month_filter, months, month_labels)
         self._populate_combo(self.plot_filter, database.distinct("plot"))
         self._populate_combo(self.variant_filter, database.distinct("variant"))
-        self._populate_combo(self.status_filter, ["Healthy", "Needs Inspection"])
+        statuses = database.distinct("status")
+        self._populate_combo(self.status_filter, statuses)
 
-        records = database.fetch_records(
-            month=self.month_filter.currentData(),
-            plot=self.plot_filter.currentData(),
-            variant=self.variant_filter.currentData(),
-            status=self.status_filter.currentData(),
+        try:
+            records = database.fetch_records(
+                month=self.month_filter.currentData(),
+                plot=self.plot_filter.currentData(),
+                variant=self.variant_filter.currentData(),
+                status=self.status_filter.currentData(),
+            )
+        except Exception as exc:
+            # Keep the Records tab usable even if the local DB is unavailable.
+            self._render_rows([])
+            self.empty_label.setText(f"Unable to load records: {exc}")
+            self.empty_label.setVisible(True)
+            return
+
+        self.empty_label.setText(
+            "No records yet. Evaluate a photo from Control to add one."
         )
         self._render_rows(records)
 

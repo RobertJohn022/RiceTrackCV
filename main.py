@@ -95,6 +95,7 @@ class MainWindow(QMainWindow):
         self.records_page = RecordsPage()
         self.validation_page = ValidationPage()
         self.standards_page = StandardsPage()
+        self.control_page.record_saved.connect(self._record_saved)
         
         for page in (self.control_page, self.map_page, self.records_page,
                      self.validation_page, self.standards_page):
@@ -104,10 +105,17 @@ class MainWindow(QMainWindow):
         self.map_page.open_record.connect(self._open_record)
         self.standards_page.saved.connect(self._standards_saved)
 
+    def _record_saved(self, _record_id):
+        self.records_page.refresh()
+        self.validation_page.refresh()
+
     def _navigate(self, index):
         self.stack.setCurrentIndex(index)
-        if self.stack.widget(index) is self.records_page:
+        widget = self.stack.widget(index)
+        if widget is self.records_page:
             self.records_page.refresh()
+        elif widget is self.validation_page:
+            self.validation_page.refresh()
 
     def _open_record(self, record_id):
         self.records_page.select(record_id)

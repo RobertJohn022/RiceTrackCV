@@ -1,20 +1,15 @@
 """
 database.py
 -------------
-Tiny SQLite-backed store for RiceTrack inspection records.
+SQLite-backed storage for RiceTrack inspection records and validation pairs.
 
-    - tab_control.py calls insert_record() when the operator presses
-      "Evaluate" on a loaded photo.
-    - tab_records.py calls fetch_records() / distinct() / distinct_months()
-      to populate the Records table and its filters.
-
-Only avg_hue, leaf_report and the image are actually measured by the
-current computer-vision pipeline (see vision.py). Plot, variant, GPS,
-average height and the height report don't have a real sensor behind
-them yet, so every insert falls back to the stub defaults below unless
-the caller supplies real values later on.
+Operational records are written by tab_control.py and read by tab_records.py.
+Validation readings are kept separately so manual/reference measurements do
+not masquerade as rover/CV results. tab_validation.py pairs a reference
+reading with an existing CV record and computes live MAE/RMSE statistics.
 """
 
+import math
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -23,12 +18,16 @@ from common import STANDARDS
 
 DB_PATH = Path(__file__).resolve().parent / "ricetrack.db"
 
-# Stub defaults for fields the current prototype can't measure yet.
 DEFAULT_PLOT = "A-01"
 DEFAULT_VARIANT = "NSIC Rc 222"
 DEFAULT_GPS = "15.67170, 120.89280"
 DEFAULT_AVG_HEIGHT = 100.0
 DEFAULT_HEIGHT_REPORT = "healthy"
+
+# Preliminary Health Index constants stated in the thesis methodology.
+IDEAL_HUE = 58.5
+MAX_HUE_DEVIATION = 27.5
+IDEAL_HEIGHT = 99.5
 
 _DISTINCT_ALLOWED = {"plot", "variant", "status"}
 
@@ -58,6 +57,33 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS validation_readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                manual_height REAL NOT NULL,
+                manual_hue REAL NOT NULL,
+                height_error REAL NOT NULL,
+                hue_error REAL NOT NULL,
+                color_score REAL NOT NULL,
+                height_score REAL NOT NULL,
+                health_index REAL NOT NULL,
+                status TEXT NOT NULL,
+                notes TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(record_id) REFERENCES records(id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_validation_record_id "
+            "ON validation_readings(record_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_validation_created_at "
+            "ON validation_readings(created_at)"
+        )
 
 
 def _compute_status(color_ok: bool, height_ok: bool) -> str:
@@ -68,6 +94,34 @@ def _compute_status(color_ok: bool, height_ok: bool) -> str:
     return "Needs Inspection - " + ("color" if not color_ok else "height")
 
 
+def compute_test_status(manual_height: float, manual_hue: float) -> str:
+    """Return the requested Test-* status for a manual/reference reading."""
+    color_ok = STANDARDS["hue"][0] <= manual_hue <= STANDARDS["hue"][1]
+    height_ok = STANDARDS["height"][0] <= manual_height <= STANDARDS["height"][1]
+
+    if color_ok and height_ok:
+        return "Test - Healthy"
+    if not color_ok and not height_ok:
+        return "Test - Unhealthy - color + height"
+    if not color_ok:
+        return "Test - Unhealthy - color"
+    return "Test - Unhealthy - height"
+
+
+def _health_index_scores(manual_height: float, manual_hue: float):
+    """Apply the preliminary Health Index formulas from the thesis."""
+    color_score = max(
+        0.0,
+        min(100.0, 100.0 - (abs(IDEAL_HUE - manual_hue) / MAX_HUE_DEVIATION * 100.0)),
+    )
+    height_score = max(
+        0.0,
+        min(100.0, 100.0 - (abs(IDEAL_HEIGHT - manual_height) / IDEAL_HEIGHT * 100.0)),
+    )
+    health_index = 0.7 * color_score + 0.3 * height_score
+    return color_score, height_score, health_index
+
+
 def _next_id(conn, plot: str) -> str:
     count = conn.execute(
         "SELECT COUNT(*) FROM records WHERE plot = ?", (plot,)
@@ -76,13 +130,7 @@ def _next_id(conn, plot: str) -> str:
 
 
 def insert_record(record: dict) -> str:
-    """
-    Insert one inspection record and return its generated ID.
-
-    Required keys: "avg_hue" (float), "leaf_report" (str), "image" (bytes
-    or None). Everything else falls back to the stub defaults above if
-    not provided.
-    """
+    """Insert one operational inspection record and return its generated ID."""
     plot = record.get("plot", DEFAULT_PLOT)
     variant = record.get("variant", DEFAULT_VARIANT)
     gps = record.get("gps", DEFAULT_GPS)
@@ -95,7 +143,7 @@ def insert_record(record: dict) -> str:
 
     height_ok = STANDARDS["height"][0] <= avg_height <= STANDARDS["height"][1]
     color_ok = STANDARDS["hue"][0] <= avg_hue <= STANDARDS["hue"][1]
-    status = _compute_status(color_ok, height_ok)
+    status = record.get("status") or _compute_status(color_ok, height_ok)
 
     with _connect() as conn:
         record_id = _next_id(conn, plot)
@@ -113,7 +161,7 @@ def insert_record(record: dict) -> str:
 
 
 def fetch_records(month=None, plot=None, variant=None, status=None) -> list:
-    """Return matching records, newest first, as a list of dicts."""
+    """Return matching operational records, newest first."""
     query = "SELECT * FROM records WHERE 1=1"
     params = []
     if month and month != "All":
@@ -142,17 +190,143 @@ def distinct(column: str) -> list:
     if column not in _DISTINCT_ALLOWED:
         raise ValueError(f"Unsupported column for distinct(): {column}")
     with _connect() as conn:
-        rows = conn.execute(f"SELECT DISTINCT {column} FROM records ORDER BY {column}").fetchall()
+        rows = conn.execute(
+            f"SELECT DISTINCT {column} FROM records ORDER BY {column}"
+        ).fetchall()
     return [row[0] for row in rows]
 
 
 def distinct_months() -> list:
-    """Distinct 'YYYY-MM' strings present in captured_at, newest first."""
+    """Distinct YYYY-MM values present in captured_at, newest first."""
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT DISTINCT strftime('%Y-%m', captured_at) AS m FROM records ORDER BY m DESC"
+            """
+            SELECT DISTINCT strftime('%Y-%m', captured_at) AS m
+            FROM records
+            WHERE captured_at IS NOT NULL
+            ORDER BY m DESC
+            """
         ).fetchall()
-    return [row[0] for row in rows]
+    return [row[0] for row in rows if row[0]]
+
+
+def insert_validation_reading(record_id: str, manual_height: float,
+                              manual_hue: float, notes: str = "") -> int:
+    """
+    Store one manual/reference measurement linked to an existing CV record.
+
+    The persisted status is one of:
+      Test - Healthy
+      Test - Unhealthy - color
+      Test - Unhealthy - height
+      Test - Unhealthy - color + height
+    """
+    try:
+        manual_height = float(manual_height)
+        manual_hue = float(manual_hue)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Manual height and hue must be numeric.") from exc
+
+    if not math.isfinite(manual_height) or not math.isfinite(manual_hue):
+        raise ValueError("Manual height and hue must be finite values.")
+    if not (0.0 <= manual_hue <= 179.0):
+        raise ValueError("Manual hue must be between 0 and 179.")
+    if manual_height <= 0.0:
+        raise ValueError("Manual height must be greater than 0 cm.")
+
+    with _connect() as conn:
+        cv_row = conn.execute(
+            "SELECT avg_height, avg_hue FROM records WHERE id = ?",
+            (record_id,),
+        ).fetchone()
+        if cv_row is None:
+            raise ValueError(f"CV record {record_id} was not found.")
+
+        color_score, height_score, health_index = _health_index_scores(
+            manual_height, manual_hue
+        )
+        height_error = abs(float(cv_row["avg_height"]) - manual_height)
+        hue_error = abs(float(cv_row["avg_hue"]) - manual_hue)
+        status = compute_test_status(manual_height, manual_hue)
+
+        cursor = conn.execute(
+            """
+            INSERT INTO validation_readings
+                (record_id, created_at, manual_height, manual_hue,
+                 height_error, hue_error, color_score, height_score,
+                 health_index, status, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record_id,
+                datetime.now().isoformat(timespec="seconds"),
+                manual_height,
+                manual_hue,
+                height_error,
+                hue_error,
+                color_score,
+                height_score,
+                health_index,
+                status,
+                notes.strip(),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def fetch_validation_pairs() -> list:
+    """Return stored validation readings joined to their CV records."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                v.id AS validation_id,
+                v.record_id,
+                r.captured_at,
+                r.plot,
+                r.avg_height AS cv_height,
+                r.avg_hue AS cv_hue,
+                v.manual_height,
+                v.manual_hue,
+                v.height_error,
+                v.hue_error,
+                v.color_score,
+                v.height_score,
+                v.health_index,
+                v.status,
+                v.notes,
+                v.created_at
+            FROM validation_readings AS v
+            JOIN records AS r ON r.id = v.record_id
+            ORDER BY v.created_at DESC, v.id DESC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def validation_metrics() -> dict:
+    """Compute live MAE/RMSE values from all stored validation pairs."""
+    rows = fetch_validation_pairs()
+    n = len(rows)
+    if not n:
+        return {
+            "n": 0,
+            "height_mae": None,
+            "height_rmse": None,
+            "hue_mae": None,
+            "hue_rmse": None,
+        }
+
+    height_errors = [float(row["height_error"]) for row in rows]
+    hue_errors = [float(row["hue_error"]) for row in rows]
+
+    return {
+        "n": n,
+        "height_mae": sum(abs(e) for e in height_errors) / n,
+        "height_rmse": math.sqrt(sum(e * e for e in height_errors) / n),
+        "hue_mae": sum(abs(e) for e in hue_errors) / n,
+        "hue_rmse": math.sqrt(sum(e * e for e in hue_errors) / n),
+    }
 
 
 init_db()
