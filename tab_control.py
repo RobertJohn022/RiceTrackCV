@@ -4,15 +4,15 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox,
-    QProgressBar, QStackedWidget, QVBoxLayout, QWidget
+    QStackedWidget, QVBoxLayout, QWidget
 )
 from common import (
-    BG, BLUE, GOOD, GREEN, LINE, MUTED, RED_BG, RED_LINE, RED_TEXT, TEXT, STANDARDS,
+    BG, BLUE, GOOD, GREEN, LINE, MUTED, RED_BG, RED_LINE, RED_TEXT, TEXT, STANDARDS, WARN_TEXT,
     Chip, banner, button, card, kv_row, lbl, make_pixmap, set_prop
 )
 from vision import NoVegetationDetected, cv_to_qpixmap, encode_thumbnail, evaluate, overlay_mask
 import database
-from imu import IMUReader
+from esp32_link import ESP32Link
 
 class AttitudeTile(QFrame):
     def __init__(self, name):
@@ -230,6 +230,8 @@ class ManualView(QWidget):
         self.tilt_limit = STANDARDS["tilt"]
         self._roll, self._pitch, self._speed = 0.0, 0.0, 0.0
         self._imu_ok = False
+        self._gps = None            # (lat, lon) while the GPS has a fix
+        self._saved_note = ""
         self.image_bgr = None
         self.segmented_bgr = None
         self.showing_segmented = False
@@ -255,14 +257,13 @@ class ManualView(QWidget):
         QShortcut(QKeySequence("C"), self).activated.connect(self._capture)
 
         self.set_attitude(0.0, 0.0, 0.0)
-        self.set_capture_progress("A-02-03", True, 3, STANDARDS["gps_n"], "Waiting for GPS")
 
     def _build_left(self):
         frame, lay = card(spacing=12)
         top = QHBoxLayout()
         top.setSpacing(8)
-        top.addWidget(Chip("<span style='color:#e24b4a'>●</span> Live", "gray"))
-        top.addWidget(Chip("Plot A-02", "gray"))
+        self.source_chip = Chip("No camera", "gray")
+        top.addWidget(self.source_chip)
         top.addStretch()
         self.status_chip = Chip("No image", "gray")
         top.addWidget(self.status_chip)
@@ -346,18 +347,15 @@ class ManualView(QWidget):
         head = QHBoxLayout()
         head.addWidget(lbl("Capturing", 16, TEXT, "700"))
         head.addStretch()
-        self.capture_id = Chip("A-02-03", "gray")
+        self.capture_id = Chip("Not saved", "gray")
         head.addWidget(self.capture_id)
         sl2.addLayout(head)
 
-        self.image_value = lbl("", 13, GOOD, "600")
+        self.image_value = lbl("No image", 13, MUTED, "600")
         sl2.addLayout(kv_row("Image", self.image_value, TEXT))
-        self.gps_value = lbl("", 13, TEXT, "600")
-        sl2.addLayout(kv_row("GPS burst", self.gps_value, TEXT))
-        self.gps_bar = QProgressBar()
-        self.gps_bar.setTextVisible(False)
-        sl2.addWidget(self.gps_bar)
-        self.analysis_value = lbl("", 13, MUTED)
+        self.gps_value = lbl("No GPS detected", 13, RED_TEXT, "600")
+        sl2.addLayout(kv_row("GPS", self.gps_value, TEXT))
+        self.analysis_value = lbl("", 13, MUTED, align=Qt.AlignmentFlag.AlignRight, wrap=True)
         sl2.addLayout(kv_row("Analysis", self.analysis_value, TEXT))
         col.addWidget(status)
         col.addStretch()
@@ -408,7 +406,10 @@ class ManualView(QWidget):
         self.record_saved_for_image = False
 
         self.camera.set_frame(cv_to_qpixmap(img))
-        self.image_value.setText("✓ Loaded")
+        self._set_value(self.image_value, "✓ Loaded", GOOD)
+        self.capture_id.set_text("Not saved", "gray")
+        self.source_chip.set_text("Uploaded photo", "blue")
+        self._saved_note = ""
         self.status_chip.set_text("Ready", "gray")
         self.analysis_value.setText("Photo loaded. Press Evaluate to analyze and save it.")
         self.capture_note.setText("Ready to evaluate")
@@ -422,7 +423,10 @@ class ManualView(QWidget):
         self.last_result = None
         self.camera.set_frame(None)
         self.camera.setToolTip("Click to upload a photo")
-        self.image_value.setText("")
+        self._set_value(self.image_value, "No image", MUTED)
+        self.capture_id.set_text("Not saved", "gray")
+        self.source_chip.set_text("No camera", "gray")
+        self._saved_note = ""
         self.status_chip.set_text("No image", "gray")
         self.analysis_value.setText("")
         self.capture_note.setText("")
@@ -451,6 +455,8 @@ class ManualView(QWidget):
         if self.image_bgr is None:
             self.analysis_value.setText("Upload a photo before evaluating.")
             return
+
+        gps_text = self._gps_text()   # position at the moment Evaluate was clicked
 
         self.status_chip.set_text("Evaluating…", "gray")
         self.analysis_value.setText("Segmenting and evaluating leaf color…")
@@ -495,6 +501,7 @@ class ManualView(QWidget):
             "lab_l": result.lab_l,
             "lab_a": result.lab_a,
             "lab_b": result.lab_b,
+            "gps": gps_text,              # "" when there is no GPS fix / no ESP32
             "hue_method": "median",
             "segmentation_v_min": 12,
         }
@@ -513,10 +520,17 @@ class ManualView(QWidget):
         # requested confirmation in the lower-right status area.
         self.record_saved_for_image = True
         self.capture_btn.setEnabled(False)
+        self.capture_id.set_text(record_id, "green")
+        self._set_value(self.image_value, "✓ Saved", GOOD)
+        self._saved_note = (
+            "Report saved with GPS location. View results at the Records tab."
+            if gps_text else
+            "Report saved without GPS location. View results at the Records tab."
+        )
         self.analysis_value.setText(
             "Report saved to database. View results at the Records tab."
         )
-        self.capture_note.setText("Report saved to database. View results at the Records tab.")
+        self.capture_note.setText(self._saved_note)
         self.record_saved.emit(record_id)
 
     def _capture(self):
@@ -535,6 +549,27 @@ class ManualView(QWidget):
             (self.image_bgr is not None and not self.record_saved_for_image) or
             (self.image_bgr is None and not tilted)
         )
+
+    @staticmethod
+    def _set_value(label, text, color):
+        label.setText(text)
+        label.setStyleSheet(f"font-size: 13px; font-weight: 600; color: {color};")
+
+    def set_gps(self, state, lat, lon, sats):
+        """state: "none" (no ESP32 / GPS), "searching" (no fix yet) or "fix"."""
+        if state == "fix":
+            self._gps = (lat, lon)
+            self._set_value(self.gps_value, f"{lat:.5f}, {lon:.5f}", GOOD)
+        elif state == "searching":
+            self._gps = None
+            self._set_value(self.gps_value, f"Acquiring fix · {sats} sats", WARN_TEXT)
+        else:
+            self._gps = None
+            self._set_value(self.gps_value, "No GPS detected", RED_TEXT)
+
+    def _gps_text(self):
+        """Same format as the database default; blank when there is no fix."""
+        return f"{self._gps[0]:.5f}, {self._gps[1]:.5f}" if self._gps else ""
 
     def set_imu_available(self, ok):
         """False -> no ESP32 / no MPU-6050: roll and pitch fall back to 0."""
@@ -568,17 +603,9 @@ class ManualView(QWidget):
                 "Capture locked until rover is stable" if tilted else "Ready to capture"
             )
         elif self.record_saved_for_image:
-            self.capture_note.setText("Report saved to database. View results at the Records tab.")
+            self.capture_note.setText(self._saved_note)
         else:
             self.capture_note.setText("Ready to evaluate")
-
-    def set_capture_progress(self, capture_id, image_saved, gps_done, gps_total, analysis):
-        self.capture_id.set_text(capture_id)
-        self.image_value.setText("✓ Saved" if image_saved else "Saving…")
-        self.gps_value.setText(f"{gps_done} of {gps_total} readings")
-        self.gps_bar.setRange(0, gps_total)
-        self.gps_bar.setValue(gps_done)
-        self.analysis_value.setText(analysis)
 
 class AutoView(QWidget):
     take_over = Signal()
@@ -678,11 +705,12 @@ class ControlPage(QWidget):
         self.manual.command.connect(self.command)
         self.manual.record_saved.connect(self.record_saved)
 
-        self.imu = IMUReader(parent=self)
-        self.imu.reading.connect(self.manual.set_attitude)
-        self.imu.state_changed.connect(self.manual.set_imu_available)
-        QApplication.instance().aboutToQuit.connect(self.imu.stop)
-        self.imu.start()
+        self.link = ESP32Link(parent=self)
+        self.link.imu_reading.connect(self.manual.set_attitude)
+        self.link.imu_state.connect(self.manual.set_imu_available)
+        self.link.gps_changed.connect(self.manual.set_gps)
+        QApplication.instance().aboutToQuit.connect(self.link.stop)
+        self.link.start()
 
     def set_attitude(self, roll, pitch, speed=None):
         self.manual.set_attitude(roll, pitch, speed)
