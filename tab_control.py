@@ -1,10 +1,13 @@
-import cv2
+from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+import cv2
+import numpy as np
+
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox,
-    QStackedWidget, QVBoxLayout, QWidget
+    QStackedWidget, QVBoxLayout, QWidget, QPushButton
 )
 from common import (
     BG, BLUE, GOOD, GREEN, LINE, MUTED, RED_BG, RED_LINE, RED_TEXT, TEXT, STANDARDS, WARN_TEXT,
@@ -13,6 +16,8 @@ from common import (
 from vision import NoVegetationDetected, cv_to_qpixmap, encode_thumbnail, evaluate, overlay_mask
 import database
 from esp32_link import ESP32Link
+from imu import IMUReader
+from pi_camera import PiCamera
 
 class AttitudeTile(QFrame):
     def __init__(self, name):
@@ -72,11 +77,16 @@ class CameraView(QWidget):
     def __init__(self):
         super().__init__()
         self._frame = None
+        self._placeholder = self.PLACEHOLDER
         self.setMinimumSize(300, 220)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_frame(self, pixmap):
         self._frame = pixmap
+        self.update()
+
+    def set_placeholder(self, text):
+        self._placeholder = text
         self.update()
 
     def mousePressEvent(self, event):
@@ -109,7 +119,7 @@ class CameraView(QWidget):
         p.setFont(font)
         p.setPen(QColor(MUTED))
         p.drawText(QRectF(0, 0, w, h),
-                   Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self.PLACEHOLDER)
+                   Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self._placeholder)
 
 class RouteMap(QWidget):
     def __init__(self):
@@ -220,10 +230,66 @@ class StepList(QWidget):
             rl.addWidget(lbl(name, 13, TEXT if state != "todo" else MUTED), 1)
             self._layout.addWidget(row)
 
+class TiltStatusPanel(QFrame):
+    """Compact, hoverable IMU status row with expandable roll/pitch details."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("tiltStatusPanel")
+        self.setStyleSheet("""
+            QFrame#tiltStatusPanel { background: transparent; border-radius: 8px; }
+            QFrame#tiltStatusPanel:hover { background: #242423; }
+            QPushButton#tiltStatusToggle { background: transparent; color: #b9b8ae; border: none;
+                border-radius: 8px; padding: 5px 7px; text-align: left; }
+            QPushButton#tiltStatusToggle:hover { background: rgba(255,255,255,0.035); }
+        """)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+        self.toggle = QPushButton()
+        self.toggle.setObjectName("tiltStatusToggle")
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.setCheckable(True)
+        row = QHBoxLayout(self.toggle)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        self.name_label = lbl("Tilt", 13, TEXT)
+        self.state_label = lbl("No IMU detected", 13, RED_TEXT, "600")
+        self.chevron = lbl("⌄", 14, MUTED, "600")
+        row.addWidget(self.name_label)
+        row.addStretch(1)
+        row.addWidget(self.state_label)
+        row.addWidget(self.chevron)
+        outer.addWidget(self.toggle)
+
+        self.details = QWidget()
+        detail_layout = QVBoxLayout(self.details)
+        detail_layout.setContentsMargins(8, 1, 8, 5)
+        detail_layout.setSpacing(4)
+        self.roll_value = lbl("—", 12, MUTED, "600")
+        self.pitch_value = lbl("—", 12, MUTED, "600")
+        detail_layout.addLayout(kv_row("Roll", self.roll_value, MUTED))
+        detail_layout.addLayout(kv_row("Pitch", self.pitch_value, MUTED))
+        self.details.setVisible(False)
+        outer.addWidget(self.details)
+        self.toggle.toggled.connect(self._set_expanded)
+
+    def _set_expanded(self, expanded):
+        self.details.setVisible(expanded)
+        self.chevron.setText("⌃" if expanded else "⌄")
+
+    def set_state(self, state, kind, roll=None, pitch=None):
+        color = GOOD if kind == "green" else RED_TEXT
+        self.state_label.setText(state)
+        self.state_label.setStyleSheet(f"font-size: 13px; font-weight: 600; color: {color};")
+        self.roll_value.setText(f"{roll:.1f}°" if roll is not None else "—")
+        self.pitch_value.setText(f"{pitch:.1f}°" if pitch is not None else "—")
+
+
 class ManualView(QWidget):
     switch_auto = Signal()
     command = Signal(str)
     record_saved = Signal(str)
+    pi_capture = Signal()           # ask the Pi camera for a photo
 
     def __init__(self):
         super().__init__()
@@ -237,6 +303,8 @@ class ManualView(QWidget):
         self.showing_segmented = False
         self.last_result = None
         self.record_saved_for_image = False
+        self._pi_online = False
+        self._capturing = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -262,7 +330,8 @@ class ManualView(QWidget):
         frame, lay = card(spacing=12)
         top = QHBoxLayout()
         top.setSpacing(8)
-        self.source_chip = Chip("No camera", "gray")
+        self.source_chip = Chip("No Camera", "gray")
+        self._style_source_chip(False)
         top.addWidget(self.source_chip)
         top.addStretch()
         self.status_chip = Chip("No image", "gray")
@@ -274,13 +343,16 @@ class ManualView(QWidget):
         self.camera.clicked.connect(self._on_camera_clicked)
         lay.addWidget(self.camera, 1)
 
-        tiles = QHBoxLayout()
-        tiles.setSpacing(10)
-        self.roll_tile, self.pitch_tile, self.speed_tile = (
-            AttitudeTile("Roll"), AttitudeTile("Pitch"), AttitudeTile("Speed"))
-        for tile in (self.roll_tile, self.pitch_tile, self.speed_tile):
-            tiles.addWidget(tile, 1)
-        lay.addLayout(tiles)
+        self._live_active = False
+        self._preview_pixmap = None
+        self.live_view_btn = button(" Start Live View", "dark", "video")
+        self.live_view_btn.setToolTip("Show the rover camera feed in this display")
+        self.live_view_btn.clicked.connect(self._toggle_live_view)
+        lay.addWidget(self.live_view_btn)
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(100)  # target up to 10 FPS; actual rate depends on Pi/network
+        self._live_timer.timeout.connect(self._request_preview_frame)
+
         return frame
 
     def _build_right(self):
@@ -353,6 +425,8 @@ class ManualView(QWidget):
 
         self.image_value = lbl("No image", 13, MUTED, "600")
         sl2.addLayout(kv_row("Image", self.image_value, TEXT))
+        self.tilt_panel = TiltStatusPanel()
+        sl2.addWidget(self.tilt_panel)
         self.gps_value = lbl("No GPS detected", 13, RED_TEXT, "600")
         sl2.addLayout(kv_row("GPS", self.gps_value, TEXT))
         self.analysis_value = lbl("", 13, MUTED, align=Qt.AlignmentFlag.AlignRight, wrap=True)
@@ -361,17 +435,69 @@ class ManualView(QWidget):
         col.addStretch()
         return holder
 
+    def _toggle_live_view(self):
+        if self._live_active:
+            self._stop_live_view()
+            return
+        if not self._pi_online:
+            self.capture_note.setText("Pi camera offline. Live view is unavailable.")
+            return
+        self._live_active = True
+        self.live_view_btn.setText(" Stop Live View")
+        self.camera.set_placeholder("Connecting to rover camera…")
+        self.camera.set_frame(None)
+        self.capture_note.setText("Live preview active. Capture a photo for full-resolution analysis.")
+        self._live_timer.start()
+        self._request_preview_frame()
+
+    def _stop_live_view(self):
+        self._live_active = False
+        self._live_timer.stop()
+        self.live_view_btn.setText(" Start Live View")
+        # Restore the actual still/segmented image without changing image_bgr.
+        if self.image_bgr is not None:
+            frame = self.segmented_bgr if self.showing_segmented and self.segmented_bgr is not None else self.image_bgr
+            self.camera.set_frame(cv_to_qpixmap(frame))
+        else:
+            self.camera.set_frame(None)
+            self._refresh_source()
+            self.capture_note.setText("Live preview stopped.")
+
+    def _request_preview_frame(self):
+        if self._live_active and self._pi_online and hasattr(self, "_pi_camera_client"):
+            self._pi_camera_client.preview_frame()
+
+    def on_preview_frame(self, jpeg_bytes):
+        if not self._live_active:
+            return
+        from PySide6.QtGui import QPixmap
+        pixmap = QPixmap()
+        if pixmap.loadFromData(jpeg_bytes, "JPG"):
+            self._preview_pixmap = pixmap
+            self.camera.set_frame(pixmap)
+
+    def on_preview_failed(self, message):
+        if self._live_active:
+            self.capture_note.setText(f"Live preview issue: {message}")
+
+    def set_preview_client(self, client):
+        self._pi_camera_client = client
+
     def _to_auto(self):
         self.manual_btn.setChecked(True)
         self.switch_auto.emit()
 
     def _on_camera_clicked(self):
+        if self._capturing:
+            return
         if self.image_bgr is None:
             self._upload_image()
         else:
             self._toggle_view()
 
     def _on_upload_button(self):
+        if self._capturing:
+            return
         if self.image_bgr is None:
             self._upload_image()
         else:
@@ -399,6 +525,12 @@ class ManualView(QWidget):
             QMessageBox.warning(self, "Unable to Load Image", f"Could not read:\n{path}")
             return
 
+        self._show_loaded_image(img, "Uploaded photo", "blue",
+                                "Photo loaded. Press Evaluate to analyze and save it.")
+
+    def _show_loaded_image(self, img, source, kind, message):
+        if self._live_active:
+            self._stop_live_view()
         self.image_bgr = img
         self.segmented_bgr = None
         self.showing_segmented = False
@@ -408,10 +540,10 @@ class ManualView(QWidget):
         self.camera.set_frame(cv_to_qpixmap(img))
         self._set_value(self.image_value, "✓ Loaded", GOOD)
         self.capture_id.set_text("Not saved", "gray")
-        self.source_chip.set_text("Uploaded photo", "blue")
+        self.source_chip.set_text(source, kind)
         self._saved_note = ""
         self.status_chip.set_text("Ready", "gray")
-        self.analysis_value.setText("Photo loaded. Press Evaluate to analyze and save it.")
+        self.analysis_value.setText(message)
         self.capture_note.setText("Ready to evaluate")
         self._set_image_mode(True)
         self._update_capture_enabled()
@@ -425,13 +557,14 @@ class ManualView(QWidget):
         self.camera.setToolTip("Click to upload a photo")
         self._set_value(self.image_value, "No image", MUTED)
         self.capture_id.set_text("Not saved", "gray")
-        self.source_chip.set_text("No camera", "gray")
         self._saved_note = ""
         self.status_chip.set_text("No image", "gray")
         self.analysis_value.setText("")
         self.capture_note.setText("")
         self.record_saved_for_image = False
         self._set_image_mode(False)
+        self._refresh_source()
+        self.set_attitude(self._roll, self._pitch)   # re-enable Capture / refresh the note
 
     def _set_image_mode(self, active):
         if active:
@@ -534,8 +667,66 @@ class ManualView(QWidget):
         self.record_saved.emit(record_id)
 
     def _capture(self):
-        if self.capture_btn.isEnabled():
-            self.command.emit("capture")
+        if self.image_bgr is not None or self._capturing or not self.capture_btn.isEnabled():
+            return
+        if not self._pi_online:
+            self.capture_note.setText("Pi camera offline. Check the Pi or upload a photo.")
+            return
+        if self._live_active:
+            self._stop_live_view()
+        self._capturing = True
+        self._update_capture_enabled()
+        self.status_chip.set_text("Capturing…", "gray")
+        self.analysis_value.setText("Taking a photo with the Pi camera…")
+        self.capture_note.setText("Capturing…")
+        self.pi_capture.emit()
+
+    def set_pi_online(self, ok):
+        self._pi_online = ok
+        if not ok and self._live_active:
+            self._stop_live_view()
+        self._refresh_source()
+        self.set_attitude(self._roll, self._pitch)
+
+    def _style_source_chip(self, active):
+        bg, fg = ("#11260f", GOOD) if active else ("#1a1a19", "#b9b8ae")
+        self.source_chip.setStyleSheet(
+            f"QFrame#chip {{ background: {bg}; border-radius: 12px; }}")
+        self.source_chip._text.setStyleSheet(
+            f"font-size: 11px; font-weight: 600; color: {fg};")
+        self.source_chip.layout().setContentsMargins(8, 3, 8, 3)
+        self.source_chip.layout().setSpacing(4)
+
+    def _refresh_source(self):
+        """Source chip and placeholder when no photo is loaded."""
+        if self.image_bgr is not None:
+            return
+        if self._pi_online:
+            self.source_chip.set_text("Camera Active", "green")
+            self._style_source_chip(True)
+            self.camera.set_placeholder("Pi camera ready. Press Capture, or click to add an image")
+        else:
+            self.source_chip.set_text("No Camera", "gray")
+            self._style_source_chip(False)
+            self.camera.set_placeholder(CameraView.PLACEHOLDER)
+
+    def on_pi_captured(self, jpeg_bytes, _info, saved_path):
+        self._capturing = False
+        img = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            self.status_chip.set_text("Capture error", "red")
+            self.analysis_value.setText("The Pi sent an image that could not be read.")
+            self.set_attitude(self._roll, self._pitch)
+            return
+        name = Path(saved_path).name if saved_path else "(copy not saved to disk)"
+        self._show_loaded_image(img, "Pi camera", "green",
+                                f"Captured {name}. Press Evaluate to analyze and save it.")
+
+    def on_pi_capture_failed(self, message):
+        self._capturing = False
+        self.status_chip.set_text("Capture failed", "red")
+        self.analysis_value.setText(message)
+        self.set_attitude(self._roll, self._pitch)
 
     def set_tilt_limit(self, limit):
         self.tilt_limit = limit
@@ -546,8 +737,9 @@ class ManualView(QWidget):
         # be evaluable. The button is "Evaluate" whenever an image is loaded.
         tilted = max(abs(self._roll), abs(self._pitch)) > self.tilt_limit
         self.capture_btn.setEnabled(
-            (self.image_bgr is not None and not self.record_saved_for_image) or
-            (self.image_bgr is None and not tilted)
+            not self._capturing and (
+                (self.image_bgr is not None and not self.record_saved_for_image) or
+                (self.image_bgr is None and not tilted))
         )
 
     @staticmethod
@@ -583,25 +775,29 @@ class ManualView(QWidget):
             speed = self._speed
         self._roll, self._pitch, self._speed = roll, pitch, speed
         limit = self.tilt_limit
-        self.roll_tile.set_value(f"{roll:.0f}°", abs(roll) > limit)
-        self.pitch_tile.set_value(f"{pitch:.0f}°", abs(pitch) > limit)
-        self.speed_tile.set_value(f"{speed:.1f} m/s", False)
-
         tilt = max(abs(roll), abs(pitch))
         tilted = tilt > limit
         if not self._imu_ok:
+            self.tilt_panel.set_state("No IMU detected", "red")
             self.alert.set_state("red", "No IMU sensors detected")
         elif tilted:
+            self.tilt_panel.set_state("Tilted", "red", roll, pitch)
             self.alert.set_state(
                 "red", f"Rover tilted {tilt:.0f}°, above the {limit}° limit. Reposition before capturing.")
         else:
+            self.tilt_panel.set_state("Straight", "green", roll, pitch)
             self.alert.set_state("green", f"Rover level · {tilt:.0f}° tilt, within the {limit}° limit")
         self._update_capture_enabled()
 
-        if self.image_bgr is None:
-            self.capture_note.setText(
-                "Capture locked until rover is stable" if tilted else "Ready to capture"
-            )
+        if self._capturing:
+            self.capture_note.setText("Capturing…")
+        elif self.image_bgr is None:
+            if tilted:
+                self.capture_note.setText("Capture locked until rover is stable")
+            elif self._pi_online:
+                self.capture_note.setText("Ready to capture")
+            else:
+                self.capture_note.setText("Pi camera offline. Upload a photo")
         elif self.record_saved_for_image:
             self.capture_note.setText(self._saved_note)
         else:
@@ -705,12 +901,29 @@ class ControlPage(QWidget):
         self.manual.command.connect(self.command)
         self.manual.record_saved.connect(self.record_saved)
 
+        self.pi_camera = PiCamera(parent=self)
+        self.manual.pi_capture.connect(self.pi_camera.capture)
+        self.manual.set_preview_client(self.pi_camera)
+        self.pi_camera.preview_frame_ready.connect(self.manual.on_preview_frame)
+        self.pi_camera.preview_failed.connect(self.manual.on_preview_failed)
+        self.pi_camera.online_changed.connect(self.manual.set_pi_online)
+        self.pi_camera.captured.connect(self.manual.on_pi_captured)
+        self.pi_camera.capture_failed.connect(self.manual.on_pi_capture_failed)
+        QApplication.instance().aboutToQuit.connect(self.pi_camera.stop)
+        self.pi_camera.start()
+
+        # The MPU-6050 is now wired directly to the Raspberry Pi and read over
+        # the Pi server's /imu endpoint. ESP32Link remains active for GPS only.
         self.link = ESP32Link(parent=self)
-        self.link.imu_reading.connect(self.manual.set_attitude)
-        self.link.imu_state.connect(self.manual.set_imu_available)
         self.link.gps_changed.connect(self.manual.set_gps)
         QApplication.instance().aboutToQuit.connect(self.link.stop)
         self.link.start()
+
+        self.imu_reader = IMUReader(parent=self)
+        self.imu_reader.reading.connect(self.manual.set_attitude)
+        self.imu_reader.state_changed.connect(self.manual.set_imu_available)
+        QApplication.instance().aboutToQuit.connect(self.imu_reader.stop)
+        self.imu_reader.start()
 
     def set_attitude(self, roll, pitch, speed=None):
         self.manual.set_attitude(roll, pitch, speed)

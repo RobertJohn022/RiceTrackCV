@@ -1,147 +1,89 @@
-"""ESP32 + MPU-6050 tilt sensor, read over USB serial.
+"""RiceTrack remote IMU reader.
 
-The ESP32 firmware (esp32_imu/esp32_imu.ino) prints one of these lines:
+The MPU-6050 is connected to the Raspberry Pi, while the Qt application runs
+on the desktop. The Pi camera server exposes GET /imu and returns JSON:
+{"ok": true, "roll": ..., "pitch": ...} or {"ok": false, ...}.
 
-    $IMU,<roll>,<pitch>     MPU-6050 found, angles in degrees (20 Hz)
-    $NOIMU                  ESP32 is alive but the MPU-6050 did not answer
-
-IMUReader finds the board by itself, reconnects when it is unplugged and
-reports two things to the GUI:
-
-    reading(roll, pitch)    every new sample
-    state_changed(bool)     True  = ESP32 + MPU-6050 are delivering data
-                            False = no ESP32, or ESP32 without a working MPU-6050
-
-Needs:  pip install pyserial   (NOT the package called "serial")
+This class preserves the same signal interface used by the Control tab.
 """
-import time
+import json
+import urllib.error
+import urllib.request
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
-try:
-    import serial
-    from serial.tools import list_ports
-except ImportError:  # app still runs, it just reports "No IMU sensors detected"
-    serial = None
-    list_ports = None
+PI_HOST = "Group4-4ITC.local"  # use the same host/IP as pi_camera.py
+PI_PORT = 8000
+POLL_INTERVAL_MS = 100
+REQUEST_TIMEOUT_S = 1.0
 
-BAUD = 115200
-# USB-serial chips found on ESP32 dev boards: CP210x, CH340, FTDI, Espressif native USB
-ESP_VIDS = {0x10C4, 0x1A86, 0x0403, 0x303A}
+
+class _ImuRequest(QThread):
+    result = Signal(bool, float, float)
+    failed = Signal(str)
+
+    def __init__(self, url, timeout=REQUEST_TIMEOUT_S):
+        super().__init__()
+        self.url = url
+        self.timeout = timeout
+
+    def run(self):
+        try:
+            request = urllib.request.Request(
+                self.url, headers={"Cache-Control": "no-cache"}
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            if data.get("ok"):
+                self.result.emit(True, float(data["roll"]), float(data["pitch"]))
+            else:
+                self.result.emit(False, 0.0, 0.0)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class IMUReader(QObject):
-    reading = Signal(float, float)   # roll, pitch (degrees)
+    """Poll the Pi's I2C-backed IMU endpoint and emit roll/pitch in degrees."""
+
+    reading = Signal(float, float)
     state_changed = Signal(bool)
 
-    SCAN_MS = 2000        # how often to look for a board while none is connected
-    POLL_MS = 20          # how often to drain the serial buffer
-    BOOT_GRACE_S = 4.0    # opening the port resets most ESP32 boards; wait for the first line
-    TIMEOUT_S = 1.5       # silence this long after the first line = board unplugged / hung
-
-    def __init__(self, port=None, parent=None):
-        """port=None -> auto-detect. Pass e.g. "COM5" or "/dev/ttyUSB0" to force one."""
+    def __init__(self, host=PI_HOST, port=PI_PORT, parent=None):
         super().__init__(parent)
-        self._fixed_port = port
-        self._port = None
-        self._buf = bytearray()
+        self.host = host
+        self.port = port
         self._ok = False
-        self._seen = False        # got at least one protocol line on this connection
-        self._last_line = 0.0
+        self._job = None
+        self._timer = QTimer(self)
+        self._timer.setInterval(POLL_INTERVAL_MS)
+        self._timer.timeout.connect(self._poll)
 
-        self._scan_timer = QTimer(self)
-        self._scan_timer.timeout.connect(self._try_open)
-        self._poll_timer = QTimer(self)
-        self._poll_timer.timeout.connect(self._poll)
-
-    # ---- lifecycle -------------------------------------------------------
     def start(self):
-        self._try_open()
-        self._scan_timer.start(self.SCAN_MS)
-        self._poll_timer.start(self.POLL_MS)
+        self._poll()
+        self._timer.start()
 
     def stop(self):
-        self._scan_timer.stop()
-        self._poll_timer.stop()
-        self._drop()
+        self._timer.stop()
+        if self._job is not None and self._job.isRunning():
+            self._job.wait(1500)
 
-    # ---- connection ------------------------------------------------------
-    def _candidates(self):
-        if serial is None:
-            return []
-        if self._fixed_port:
-            return [self._fixed_port]
-        return [p.device for p in list_ports.comports() if p.vid in ESP_VIDS]
-
-    def _try_open(self):
-        if self._port is not None:
+    def _poll(self):
+        if self._job is not None and self._job.isRunning():
             return
-        for device in self._candidates():
-            try:
-                self._port = serial.Serial(device, BAUD, timeout=0)
-            except (serial.SerialException, OSError):
-                continue  # busy (Serial Monitor open?) or vanished
-            self._buf.clear()
-            self._seen = False
-            self._last_line = time.monotonic()
-            return
-
-    def _drop(self):
-        if self._port is not None:
-            try:
-                self._port.close()
-            except (serial.SerialException, OSError):
-                pass
-            self._port = None
-        self._set_ok(False)
+        self._job = _ImuRequest(f"http://{self.host}:{self.port}/imu")
+        self._job.result.connect(self._on_result)
+        self._job.failed.connect(self._on_failed)
+        self._job.start()
 
     def _set_ok(self, ok):
         if ok != self._ok:
             self._ok = ok
             self.state_changed.emit(ok)
 
-    # ---- reading ---------------------------------------------------------
-    def _poll(self):
-        if self._port is None:
-            return
-        try:
-            data = self._port.read(4096)
-        except (serial.SerialException, OSError):
-            self._drop()
-            return
-        if data:
-            self.feed(data)
-
-        limit = self.TIMEOUT_S if self._seen else self.BOOT_GRACE_S
-        if time.monotonic() - self._last_line > limit:
-            self._drop()
-
-    def feed(self, data):
-        """Accepts raw bytes from the port. Public so it can be unit-tested without hardware."""
-        self._buf += data
-        while True:
-            line, sep, rest = self._buf.partition(b"\n")
-            if not sep:
-                break
-            self._buf = rest
-            self._handle_line(line.decode("ascii", "ignore").strip())
-        if len(self._buf) > 4096:   # boot-ROM garbage with no newline
-            self._buf.clear()
-
-    def _handle_line(self, line):
-        if line.startswith("$IMU,"):
-            try:
-                _, roll, pitch = line.split(",")
-                roll, pitch = float(roll), float(pitch)
-            except ValueError:
-                return
-            self._mark_seen()
-            self._set_ok(True)
+    def _on_result(self, ok, roll, pitch):
+        self._set_ok(ok)
+        if ok:
             self.reading.emit(roll, pitch)
-        elif line == "$NOIMU":
-            self._mark_seen()
-            self._set_ok(False)
 
-    def _mark_seen(self):
-        self._seen = True
-        self._last_line = time.monotonic()
+    def _on_failed(self, _message):
+        self._set_ok(False)

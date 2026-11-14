@@ -14,7 +14,7 @@ from tab_standards import StandardsPage
 
 class Sidebar(QFrame):
     navigate = Signal(int)
-    ITEMS = [("Control", "wheel"), ("Field map", "map"), ("Records", "list"),
+    ITEMS = [("Controls", "wheel"), ("Field map", "map"), ("Records", "list"),
              ("Validation", "chart"), ("Standards", "sliders")]
 
     def __init__(self, session="Session 07", user="PhilRice Muñoz", mode="Offline mode"):
